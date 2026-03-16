@@ -121,6 +121,23 @@ class H265Encoder(_PyAvEncoder):
         )
 
 
+class VVCEncoder(_PyAvEncoder):
+    def __init__(self, width: int, height: int, fps: int, jpeg_quality: int) -> None:
+        qp = _quality_to_crf(jpeg_quality)
+        super().__init__(
+            codec_label="H266/VVC",
+            candidates=("libvvenc", "vvc"),
+            width=width,
+            height=height,
+            fps=fps,
+            jpeg_quality=jpeg_quality,
+            options_candidates=(
+                {"preset": "fast", "qp": str(qp)},
+                {},
+            ),
+        )
+
+
 class VP9Encoder(_PyAvEncoder):
     def __init__(self, width: int, height: int, fps: int, jpeg_quality: int) -> None:
         crf = _quality_to_crf(jpeg_quality)
@@ -215,6 +232,16 @@ class H264Decoder(_PyAvDecoder):
 class H265Decoder(_PyAvDecoder):
     def __init__(self) -> None:
         super().__init__("H265", ("hevc",))
+
+    def decode_packet(self, payload: bytes) -> list[np.ndarray]:
+        packet = av.Packet(payload)
+        frames = self._context.decode(packet)
+        return [frame.to_ndarray(format="bgr24") for frame in frames]
+
+
+class VVCDecoder(_PyAvDecoder):
+    def __init__(self) -> None:
+        super().__init__("H266/VVC", ("libvvdec", "vvc"))
 
     def decode_packet(self, payload: bytes) -> list[np.ndarray]:
         packet = av.Packet(payload)

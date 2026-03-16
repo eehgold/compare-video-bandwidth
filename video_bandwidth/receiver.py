@@ -14,6 +14,7 @@ from video_bandwidth.codecs import (
     CodecUnavailableError,
     H264Decoder,
     H265Decoder,
+    VVCDecoder,
     VP9Decoder,
     decode_mjpeg,
 )
@@ -21,6 +22,7 @@ from video_bandwidth.protocol import (
     CODEC_AV1,
     CODEC_H264,
     CODEC_H265,
+    CODEC_H266,
     CODEC_MJPEG,
     CODEC_VP9,
     ControlSettings,
@@ -31,13 +33,14 @@ from video_bandwidth.protocol import (
     recv_frame,
     send_control,
 )
+from video_bandwidth.vehicle_counter import CarCounter, CounterResult, CounterUnavailableError
 
 WINDOW_NAME = "Video Bandwidth Receiver"
 FPS_MIN = 1
 FPS_MAX = 60
 QUALITY_MIN = 1
 QUALITY_MAX = 100
-CODEC_VALUES = (CODEC_MJPEG, CODEC_H264, CODEC_H265, CODEC_VP9, CODEC_AV1)
+CODEC_VALUES = (CODEC_MJPEG, CODEC_H264, CODEC_H265, CODEC_H266, CODEC_VP9, CODEC_AV1)
 RESOLUTION_VALUES = tuple(SUPPORTED_RESOLUTIONS)
 PANEL_WIDTH = 360
 PANEL_MIN_HEIGHT = 260
@@ -84,6 +87,16 @@ def parse_args() -> argparse.Namespace:
         choices=list(CODEC_VALUES),
         help="Initial codec requested by the receiver.",
     )
+    parser.add_argument(
+        "--enable-car-counter",
+        action="store_true",
+        help="Enable car counting by default (YOLO) on receiver side.",
+    )
+    parser.add_argument(
+        "--yolo-model",
+        default="yolov8n.pt",
+        help="YOLO model file or model name used for car detection.",
+    )
     return parser.parse_args()
 
 
@@ -95,20 +108,26 @@ class ReceiverUiState:
 
 
 class ControlsUi:
-    def __init__(self, initial_settings: ControlSettings) -> None:
+    def __init__(
+        self,
+        initial_settings: ControlSettings,
+        initial_car_counter_enabled: bool,
+    ) -> None:
         self._settings = initial_settings.normalized()
+        self._car_counter_enabled = initial_car_counter_enabled
+        self._force_car_counter_enabled: bool | None = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._ready = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
-            args=(self._settings,),
+            args=(self._settings, initial_car_counter_enabled),
             daemon=True,
         )
         self._thread.start()
         self._ready.wait(timeout=2.0)
 
-    def _run(self, initial_settings: ControlSettings) -> None:
+    def _run(self, initial_settings: ControlSettings, initial_car_counter_enabled: bool) -> None:
         try:
             import tkinter as tk
             from tkinter import ttk
@@ -119,7 +138,7 @@ class ControlsUi:
 
         root = tk.Tk()
         root.title("Receiver Controls")
-        root.geometry("340x520")
+        root.geometry("340x620")
         root.resizable(False, False)
 
         container = ttk.Frame(root, padding=12)
@@ -137,6 +156,7 @@ class ControlsUi:
             if initial_settings.resolution in RESOLUTION_VALUES
             else RESOLUTION_VALUES[0]
         )
+        car_counter_var = tk.BooleanVar(value=initial_car_counter_enabled)
 
         def publish_settings() -> None:
             settings = ControlSettings(
@@ -147,6 +167,7 @@ class ControlsUi:
             ).normalized()
             with self._lock:
                 self._settings = settings
+                self._car_counter_enabled = bool(car_counter_var.get())
 
         def on_change(*_: object) -> None:
             publish_settings()
@@ -218,6 +239,26 @@ class ControlsUi:
             **legend_kwargs,
         ).pack(fill="x", pady=(2, 8))
 
+        car_counter_check = tk.Checkbutton(
+            container,
+            text="Activer compteur de voitures (YOLO)",
+            variable=car_counter_var,
+            onvalue=True,
+            offvalue=False,
+            command=on_change,
+            anchor="w",
+            justify="left",
+        )
+        car_counter_check.pack(fill="x", pady=(4, 0))
+        tk.Label(
+            container,
+            text=(
+                "Detecte les voitures, affiche les boites et compte les vehicules "
+                "qui traversent la ligne en bas de l'image."
+            ),
+            **legend_kwargs,
+        ).pack(fill="x", pady=(2, 8))
+
         hint = ttk.Label(container, text="Changes are applied immediately")
         hint.pack(anchor="w", pady=(10, 0))
 
@@ -227,6 +268,16 @@ class ControlsUi:
         self._ready.set()
 
         while not self._stop.is_set():
+            forced_counter_state: bool | None = None
+            with self._lock:
+                forced_counter_state = self._force_car_counter_enabled
+                self._force_car_counter_enabled = None
+            if (
+                forced_counter_state is not None
+                and bool(car_counter_var.get()) != forced_counter_state
+            ):
+                car_counter_var.set(forced_counter_state)
+                publish_settings()
             try:
                 root.update_idletasks()
                 root.update()
@@ -242,6 +293,14 @@ class ControlsUi:
     def get_settings(self) -> ControlSettings:
         with self._lock:
             return self._settings
+
+    def is_car_counter_enabled(self) -> bool:
+        with self._lock:
+            return self._car_counter_enabled
+
+    def set_car_counter_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            self._force_car_counter_enabled = bool(enabled)
 
     def close(self) -> None:
         self._stop.set()
@@ -293,6 +352,11 @@ def build_display_frame(
     jitter_ms: float,
     drop_frames: int,
     drop_rate_percent: float,
+    car_counter_enabled: bool,
+    counted_cars: int,
+    detected_cars: int,
+    line_y: int | None,
+    car_counter_status: str,
 ) -> np.ndarray:
     bitrate_text, fps_text, total_text = format_stats(snapshot)
     canvas_height = max(frame.shape[0], PANEL_MIN_HEIGHT)
@@ -310,6 +374,19 @@ def build_display_frame(
         (f"Latence: {latency_ms:.1f} ms", (80, 220, 120), 0.75),
         (f"Jitter: {jitter_ms:.1f} ms", (80, 220, 120), 0.75),
         (f"Drops: {drop_frames} ({drop_rate_percent:.2f}%)", (80, 220, 120), 0.75),
+        (
+            f"Compteur voitures: {'ON' if car_counter_enabled else 'OFF'}",
+            (80, 220, 120),
+            0.75,
+        ),
+        (f"Voitures comptees: {counted_cars}", (80, 220, 120), 0.75),
+        (f"Detections YOLO: {detected_cars}", (80, 220, 120), 0.75),
+        (
+            f"Ligne de comptage: y={line_y}" if line_y is not None else "Ligne de comptage: --",
+            (80, 220, 120),
+            0.75,
+        ),
+        (f"Statut YOLO: {car_counter_status}", (80, 220, 120), 0.7),
         ("", (0, 0, 0), 0.0),
         ("Controle emetteur", (240, 240, 240), 0.9),
         (f"FPS cible: {settings.target_fps}", (0, 215, 255), 0.75),
@@ -359,11 +436,14 @@ def main() -> None:
     h264_decoder_available = True
     h265_decoder: H265Decoder | None = None
     h265_decoder_available = True
+    h266_decoder: VVCDecoder | None = None
+    h266_decoder_available = True
     vp9_decoder: VP9Decoder | None = None
     vp9_decoder_available = True
     av1_decoder: AV1Decoder | None = None
     av1_decoder_available = True
     controls_ui: ControlsUi | None = None
+    car_counter: CarCounter | None = None
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -384,9 +464,42 @@ def main() -> None:
             latency_jitter_ms = 0.0
             last_latency_ms: float | None = None
             drop_rate_percent = 0.0
+            car_counter_enabled = args.enable_car_counter and not args.no_display
+            counter_ui_prev = car_counter_enabled
+            counted_cars = 0
+            detected_cars = 0
+            line_y: int | None = None
+            car_counter_status = "desactive"
             print(f"Accepted connection from {address[0]}:{address[1]}")
             if not args.no_display:
-                controls_ui = ControlsUi(ui_state.settings)
+                controls_ui = ControlsUi(
+                    initial_settings=ui_state.settings,
+                    initial_car_counter_enabled=car_counter_enabled,
+                )
+
+            def enable_car_counter() -> bool:
+                nonlocal car_counter, counted_cars, detected_cars, line_y, car_counter_status
+                try:
+                    if car_counter is None:
+                        car_counter = CarCounter(model_name=args.yolo_model)
+                    car_counter.reset()
+                    counted_cars = 0
+                    detected_cars = 0
+                    line_y = None
+                    car_counter_status = f"actif ({args.yolo_model})"
+                    return True
+                except CounterUnavailableError as exc:
+                    car_counter_status = f"indisponible ({exc})"
+                    print(f"Car counter unavailable: {exc}")
+                    return False
+
+            if car_counter_enabled:
+                car_counter_enabled = enable_car_counter()
+                if car_counter_enabled:
+                    print("Car counter enabled")
+                elif controls_ui is not None:
+                    controls_ui.set_car_counter_enabled(False)
+                    counter_ui_prev = False
             if not maybe_send_controls(
                 conn,
                 ui_state,
@@ -404,6 +517,24 @@ def main() -> None:
                             controls_ui=controls_ui,
                         ):
                             break
+                        if not args.no_display and controls_ui is not None:
+                            desired_counter_enabled = controls_ui.is_car_counter_enabled()
+                            if desired_counter_enabled != counter_ui_prev:
+                                counter_ui_prev = desired_counter_enabled
+                                if desired_counter_enabled:
+                                    car_counter_enabled = enable_car_counter()
+                                    if car_counter_enabled:
+                                        print("Car counter enabled")
+                                    elif controls_ui is not None:
+                                        controls_ui.set_car_counter_enabled(False)
+                                        counter_ui_prev = False
+                                else:
+                                    car_counter_enabled = False
+                                    counted_cars = 0
+                                    detected_cars = 0
+                                    line_y = None
+                                    car_counter_status = "desactive"
+                                    print("Car counter disabled")
                         frame_id, sent_at_ns, codec, payload, byte_count = recv_frame(conn)
                     except ConnectionError:
                         break
@@ -420,6 +551,15 @@ def main() -> None:
                         latency_avg_ms = 0.0
                         latency_jitter_ms = 0.0
                         last_latency_ms = None
+                        if car_counter_enabled and car_counter is not None:
+                            car_counter.reset()
+                        counted_cars = 0
+                        detected_cars = 0
+                        line_y = None
+                        if car_counter_enabled:
+                            car_counter_status = f"actif ({args.yolo_model})"
+                        else:
+                            car_counter_status = "desactive"
                         print(f"Codec switched to {codec.upper()} -> indicators reset")
 
                     if last_frame_id is None:
@@ -464,6 +604,19 @@ def main() -> None:
                                 decoded_frames = h265_decoder.decode_packet(payload)
                             except Exception as exc:
                                 print(f"H265 decode error: {exc}")
+                                decoded_frames = []
+                    elif codec == CODEC_H266:
+                        if h266_decoder_available and h266_decoder is None:
+                            try:
+                                h266_decoder = VVCDecoder()
+                            except CodecUnavailableError as exc:
+                                h266_decoder_available = False
+                                print(f"H266/VVC decoder unavailable: {exc}")
+                        if h266_decoder is not None:
+                            try:
+                                decoded_frames = h266_decoder.decode_packet(payload)
+                            except Exception as exc:
+                                print(f"H266/VVC decode error: {exc}")
                                 decoded_frames = []
                     elif codec == CODEC_VP9:
                         if vp9_decoder_available and vp9_decoder is None:
@@ -528,9 +681,38 @@ def main() -> None:
                         )
                     stop_requested = False
                     for frame in decoded_frames:
+                        frame_for_display = frame
+                        if car_counter_enabled and car_counter is not None:
+                            try:
+                                counter_result: CounterResult = car_counter.process(frame)
+                                frame_for_display = counter_result.frame
+                                counted_cars = counter_result.counted_cars
+                                detected_cars = counter_result.detections
+                                line_y = counter_result.line_y
+                            except CounterUnavailableError as exc:
+                                car_counter_enabled = False
+                                counted_cars = 0
+                                detected_cars = 0
+                                line_y = None
+                                car_counter_status = f"indisponible ({exc})"
+                                if controls_ui is not None:
+                                    controls_ui.set_car_counter_enabled(False)
+                                    counter_ui_prev = False
+                                print(f"Car counter unavailable: {exc}")
+                            except Exception as exc:
+                                car_counter_enabled = False
+                                counted_cars = 0
+                                detected_cars = 0
+                                line_y = None
+                                car_counter_status = f"erreur runtime ({exc})"
+                                if controls_ui is not None:
+                                    controls_ui.set_car_counter_enabled(False)
+                                    counter_ui_prev = False
+                                print(f"Car counter runtime error: {exc}")
+
                         if not args.no_display:
                             display_frame = build_display_frame(
-                                frame,
+                                frame_for_display,
                                 last_snapshot,
                                 ui_state.settings,
                                 ui_state.active_codec,
@@ -538,6 +720,11 @@ def main() -> None:
                                 latency_jitter_ms,
                                 drop_frames,
                                 drop_rate_percent,
+                                car_counter_enabled,
+                                counted_cars,
+                                detected_cars,
+                                line_y,
+                                car_counter_status,
                             )
                             cv2.imshow(WINDOW_NAME, display_frame)
                             key = cv2.waitKey(1) & 0xFF

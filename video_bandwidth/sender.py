@@ -14,12 +14,14 @@ from video_bandwidth.codecs import (
     CodecUnavailableError,
     H264Encoder,
     H265Encoder,
+    VVCEncoder,
     VP9Encoder,
 )
 from video_bandwidth.protocol import (
     CODEC_AV1,
     CODEC_H264,
     CODEC_H265,
+    CODEC_H266,
     CODEC_MJPEG,
     CODEC_VP9,
     ControlSettings,
@@ -64,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--codec",
         default=CODEC_MJPEG,
-        choices=[CODEC_MJPEG, CODEC_H264, CODEC_H265, CODEC_VP9, CODEC_AV1],
+        choices=[CODEC_MJPEG, CODEC_H264, CODEC_H265, CODEC_H266, CODEC_VP9, CODEC_AV1],
         help="Default codec until the receiver overrides it.",
     )
     parser.add_argument(
@@ -146,17 +148,19 @@ def main() -> None:
         ).normalized()
     )
     state_lock = threading.Lock()
-    encoders: dict[str, H264Encoder | H265Encoder | VP9Encoder | AV1Encoder] = {}
+    encoders: dict[str, H264Encoder | H265Encoder | VVCEncoder | VP9Encoder | AV1Encoder] = {}
     encoder_params: dict[str, tuple[int, int, int, int]] = {}
     codec_supported = {
         CODEC_H264: True,
         CODEC_H265: True,
+        CODEC_H266: True,
         CODEC_VP9: True,
         CODEC_AV1: True,
     }
     empty_output_streak = {
         CODEC_H264: 0,
         CODEC_H265: 0,
+        CODEC_H266: 0,
         CODEC_VP9: 0,
         CODEC_AV1: 0,
     }
@@ -205,7 +209,7 @@ def main() -> None:
                 codec = settings.codec
                 payloads: list[bytes] = []
 
-                if codec in (CODEC_H264, CODEC_H265, CODEC_VP9, CODEC_AV1) and codec_supported[codec]:
+                if codec in (CODEC_H264, CODEC_H265, CODEC_H266, CODEC_VP9, CODEC_AV1) and codec_supported[codec]:
                     frame_params = (
                         frame.shape[1],
                         frame.shape[0],
@@ -223,6 +227,13 @@ def main() -> None:
                                 )
                             elif codec == CODEC_H265:
                                 encoders[codec] = H265Encoder(
+                                    width=frame_params[0],
+                                    height=frame_params[1],
+                                    fps=frame_params[2],
+                                    jpeg_quality=frame_params[3],
+                                )
+                            elif codec == CODEC_H266:
+                                encoders[codec] = VVCEncoder(
                                     width=frame_params[0],
                                     height=frame_params[1],
                                     fps=frame_params[2],
@@ -252,7 +263,7 @@ def main() -> None:
                         encoders.pop(failing_codec, None)
                         encoder_params.pop(failing_codec, None)
                         codec = CODEC_MJPEG
-                elif codec in (CODEC_H264, CODEC_H265, CODEC_VP9, CODEC_AV1) and not codec_supported[codec]:
+                elif codec in (CODEC_H264, CODEC_H265, CODEC_H266, CODEC_VP9, CODEC_AV1) and not codec_supported[codec]:
                     codec = CODEC_MJPEG
 
                 if codec in empty_output_streak:
