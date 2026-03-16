@@ -2,6 +2,14 @@
 
 Ce projet simule un flux video temps reel entre un emetteur et un recepteur afin de mesurer le debit reseau observe de chaque cote.
 
+Projet open source pour tester et comparer l'impact des codecs video sur le debit reseau, la latence et la stabilite du flux.
+
+## Open Source
+
+- Objectif: fournir un bench simple et reproductible pour comparer `mjpeg`, `h264`, `h265`, `vp9`, `av1`.
+- Statut: repository public.
+- Licence: `MIT` (voir [LICENSE](LICENSE)).
+
 ## Principe
 
 - L'emetteur lit une source video avec OpenCV.
@@ -11,6 +19,21 @@ Ce projet simule un flux video temps reel entre un emetteur et un recepteur afin
 - Le recepteur decode les frames, affiche la video en temps reel, mesure le debit recu et pilote les reglages du flux.
 
 Le debit affiche est le debit applicatif, calcule a partir des octets effectivement envoyes/recus par le programme.
+
+## Schema
+
+```mermaid
+flowchart LR
+    A[Source video\nMP4 local ou RTSP] --> B[Sender]
+    B --> C[Encodage\nMJPEG / H264 / H265 / VP9 / AV1]
+    C --> D[Transport TCP]
+    D --> E[Receiver]
+    E --> F[Decodage\nselon codec recu]
+    E --> G[Mesures\nMb/s, fps, latence, jitter, drops]
+    E --> H[UI Controls\ncodec, resolution, fps, quality]
+    H --> I[Canal de controle]
+    I --> B
+```
 
 ## Installation
 
@@ -83,3 +106,11 @@ Quand le codec recu change (`MJPEG` -> `H264`, etc.), les indicateurs sont remis
 - Si le FPS demande est superieur au FPS source, l'emetteur reste limite par la cadence de la source.
 - En cas de reseau lent, le flux ralentira naturellement car TCP garantit la livraison et l'ordre.
 - La disponibilite reelle de `h265`, `vp9` et `av1` depend des encodeurs/decoders presents dans la build FFmpeg/PyAV locale.
+
+## Contribuer
+
+Les contributions sont bienvenues: issues, idees de metriques, nouveaux codecs, optimisations encode/decode, et scenarios de test.
+
+## Licence
+
+Ce projet est distribue sous licence MIT. Voir [LICENSE](LICENSE).
